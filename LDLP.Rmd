@@ -1,0 +1,403 @@
+---
+title: "Loan Default Loss Prediction"
+author: "sindhuja manda"
+date: "2025-11-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA)
+```
+
+```{r}
+# Loan Default Loss Prediction
+#
+# Purpose:
+#   Predict the loss amount of a loan, conditional on default,
+#   using supervised machine learning and evaluate models
+#   using Mean Absolute Error (MAE).
+#
+# What we are doing :
+#   1. Loads training and test data
+#   2. Performs basic data exploration (EDA)
+#   3. Cleans and imputes missing values
+#   4. Builds and compares models:
+#        - Baseline mean model
+#        - Random Forest regression (main model)
+#   5. Tunes Random Forest on a training sample
+#   6. Re-trains the best model on all labeled data
+#   7. Predicts loss for the unlabeled test set
+#   8. Writes a submission file: "submission_loss_predictions.csv"
+#
+
+## 0. Setup 
+
+# Set a global seed for reproducibility
+set.seed(123)
+
+# Load required libraries
+library(tidyverse)   # data manipulation + plotting
+library(ranger)      # fast random forest implementation
+
+# Simple MAE function (evaluation metric from instructions)
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+############################################################
+## 1. Load the Data 
+############################################################
+
+# Helper to drop any index-like "Unnamed" column created by write.csv
+drop_index_column <- function(df) {
+  idx_cols <- grep("^unnamed", names(df), ignore.case = TRUE)
+  if (length(idx_cols) > 0) {
+    df <- df[, -idx_cols, drop = FALSE]
+  }
+  return(df)
+}
+
+# Read training data (includes target 'loss')
+train_raw <- read.csv("train_v3.csv", stringsAsFactors = FALSE)
+train_raw <- drop_index_column(train_raw)
+
+# Read labeled test data (has loss, used only for model evaluation)
+# If your environment does not have this file, you can comment it out.
+test_labeled_raw <- read.csv("test_v3.csv", stringsAsFactors = FALSE)
+test_labeled_raw <- drop_index_column(test_labeled_raw)
+
+# Read final test data without target (we must predict loss here)
+test_unlabeled_raw <- read.csv("test__no_lossv3.csv", stringsAsFactors = FALSE)
+test_unlabeled_raw <- drop_index_column(test_unlabeled_raw)
+
+# Quick sanity checks on dimensions
+cat("Train rows, cols: ", dim(train_raw), "\n")
+cat("Labeled test rows, cols: ", dim(test_labeled_raw), "\n")
+cat("Unlabeled test rows, cols: ", dim(test_unlabeled_raw), "\n")
+
+# Column names should be identical across datasets, except for 'loss'
+# in test_unlabeled_raw.
+head(names(train_raw))
+tail(names(train_raw))
+
+############################################################
+## 2. Basic EDA (Exploratory Data Analysis)
+############################################################
+
+# 2.1 Target variable distribution (loss)
+summary(train_raw$loss)
+
+# Proportion of zero vs. positive losses (often highly skewed)
+prop_zero  <- mean(train_raw$loss == 0)
+prop_pos   <- mean(train_raw$loss  > 0)
+cat("Proportion with zero loss   :", round(prop_zero, 3), "\n")
+cat("Proportion with positive loss:", round(prop_pos, 3), "\n")
+
+# Histogram of loss (useful for report figures)
+ggplot(train_raw, aes(x = loss)) +
+  geom_histogram(bins = 50) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Distribution of Loss",
+       x = "Loss",
+       y = "Count")
+
+# 2.2 Check missing values overall
+total_na_train <- sum(is.na(train_raw))
+total_na_test_labeled <- sum(is.na(test_labeled_raw))
+total_na_test_unlabeled <- sum(is.na(test_unlabeled_raw))
+
+cat("Total NAs in train       :", total_na_train, "\n")
+cat("Total NAs in test_labeled:", total_na_test_labeled, "\n")
+cat("Total NAs in test_unlabeled:", total_na_test_unlabeled, "\n")
+
+# NA percentage per column (top 10) – useful for report
+na_perc <- colMeans(is.na(train_raw)) * 100
+na_perc_sorted <- sort(na_perc, decreasing = TRUE)
+head(na_perc_sorted, 10)
+
+# 2.3 Quick correlation of a few features with loss (for insight)
+# (Using only numeric predictors excluding id and loss)
+feature_cols_all <- setdiff(names(train_raw), c("id", "loss"))
+# Example: compute correlation for first 20 features with the target
+corr_sample <- sapply(train_raw[, feature_cols_all[1:20]], function(x) {
+  suppressWarnings(cor(x, train_raw$loss, use = "complete.obs"))
+})
+corr_sample
+
+############################################################
+## 3. Data Cleaning & Pre processing 
+############################################################
+
+# We will:
+#   - Keep 'id' but NOT use it as a predictor
+#   - Impute missing values for predictors with the median
+#     computed from the training data
+#   - Leave 'loss' unchanged
+
+# Identify predictor columns (numeric features)
+predictor_cols <- setdiff(names(train_raw), c("id", "loss"))
+
+# 3.1 Compute median for each predictor from training data
+#     (These medians will be reused to impute missing values in
+#      all datasets, to avoid target leakage.)
+median_values <- sapply(train_raw[, predictor_cols], function(x) {
+  median(x, na.rm = TRUE)
+})
+
+# 3.2 Median imputation function
+impute_median <- function(df, predictor_cols, medians) {
+  for (col in predictor_cols) {
+    # Only impute columns that exist in this df
+    if (col %in% names(df)) {
+      na_idx <- is.na(df[[col]])
+      if (any(na_idx)) {
+        df[na_idx, col] <- medians[col]
+      }
+    }
+  }
+  return(df)
+}
+
+# Apply imputation to all three datasets
+train <- impute_median(train_raw, predictor_cols, median_values)
+test_labeled <- impute_median(test_labeled_raw, predictor_cols, median_values)
+test_unlabeled <- impute_median(test_unlabeled_raw, predictor_cols, median_values)
+
+# Check that there are no remaining NAs in predictors
+cat("Remaining NAs in train predictors     :", 
+    sum(is.na(train[, predictor_cols])), "\n")
+cat("Remaining NAs in test_labeled predictors:", 
+    sum(is.na(test_labeled[, predictor_cols])), "\n")
+cat("Remaining NAs in test_unlabeled predictors:", 
+    sum(is.na(test_unlabeled[, predictor_cols])), "\n")
+
+############################################################
+## 4. Train / Validation Split for Model Evaluation ----
+############################################################
+
+# We create a random 80/20 split on the training set for
+# honest validation of model performance.
+
+set.seed(123)  # keep split reproducible
+n_train <- nrow(train)
+valid_fraction <- 0.2
+
+valid_idx <- sample(seq_len(n_train), size = floor(valid_fraction * n_train))
+train_idx <- setdiff(seq_len(n_train), valid_idx)
+
+train_train <- train[train_idx, ]
+train_valid <- train[valid_idx, ]
+
+cat("Training subset rows  :", nrow(train_train), "\n")
+cat("Validation subset rows:", nrow(train_valid), "\n")
+
+############################################################
+## 5. Baseline Model (Mean Loss) ----
+############################################################
+
+# Baseline: always predict the mean loss from the training subset.
+baseline_mean <- mean(train_train$loss)
+
+# Predictions on validation set
+baseline_pred_valid <- rep(baseline_mean, nrow(train_valid))
+
+# MAE on validation
+baseline_mae_valid <- mae(train_valid$loss, baseline_pred_valid)
+cat("Baseline (mean) MAE on validation:", round(baseline_mae_valid, 4), "\n")
+
+# For completeness, baseline MAE on labeled test set
+baseline_pred_test_labeled <- rep(mean(train$loss), nrow(test_labeled))
+baseline_mae_test_labeled <- mae(test_labeled$loss, baseline_pred_test_labeled)
+cat("Baseline (mean) MAE on labeled test:", 
+    round(baseline_mae_test_labeled, 4), "\n")
+
+############################################################
+## 6. Random Forest Model (Ranger) ----
+############################################################
+
+# We use Random Forest because:
+#   - Handles many numeric features well
+#   - Robust to non-linear relationships and interactions
+#   - Less sensitive to monotonic transformations / scaling
+# This will be our main predictive model.
+
+# 6.1 Simple tuning on a sampled subset to keep run time reasonable. 
+#     (We perform tuning on a 30k-row sample of the full train data.)
+
+set.seed(123)
+
+tune_sample_size <- min(30000, nrow(train))  # cap at 30k rows
+tune_idx <- sample(seq_len(nrow(train)), size = tune_sample_size)
+
+tune_data <- train[tune_idx, c("loss", predictor_cols)]
+
+# Internal train/validation split for tuning (80/20)
+tune_valid_idx <- sample(seq_len(nrow(tune_data)), 
+                         size = floor(0.2 * nrow(tune_data)))
+tune_train <- tune_data[-tune_valid_idx, ]
+tune_valid <- tune_data[tune_valid_idx, ]
+
+# Candidate hyper parameters
+p <- length(predictor_cols)
+mtry_grid <- c(floor(sqrt(p)), floor(p / 4))
+min_node_grid <- c(3, 5, 10)
+num_trees_tune <- 300
+
+tuning_grid <- expand.grid(
+  mtry = mtry_grid,
+  min.node.size = min_node_grid
+)
+tuning_grid$MAE <- NA_real_
+
+cat("Starting Random Forest tuning on sample of", nrow(tune_data), "rows...\n")
+
+for (i in seq_len(nrow(tuning_grid))) {
+  mtry_val <- tuning_grid$mtry[i]
+  min_node_val <- tuning_grid$min.node.size[i]
+  
+  cat("  Tuning combination", i, 
+      "of", nrow(tuning_grid), 
+      "- mtry:", mtry_val, 
+      "min.node.size:", min_node_val, "\n")
+  
+  rf_tmp <- ranger(
+    formula = loss ~ .,
+    data = tune_train[, c("loss", predictor_cols)],
+    num.trees = num_trees_tune,
+    mtry = mtry_val,
+    min.node.size = min_node_val,
+    seed = 123
+  )
+  
+  pred_tmp <- predict(rf_tmp, data = tune_valid[, predictor_cols])$predictions
+  tuning_grid$MAE[i] <- mae(tune_valid$loss, pred_tmp)
+}
+
+# View tuning results (best to worst)
+tuning_grid <- tuning_grid[order(tuning_grid$MAE), ]
+print(tuning_grid)
+
+# Best hyper parameters
+best_mtry <- tuning_grid$mtry[1]
+best_min_node <- tuning_grid$min.node.size[1]
+cat("Best hyperparameters from tuning:\n")
+cat("  mtry        :", best_mtry, "\n")
+cat("  min.node.size:", best_min_node, "\n")
+
+# 6.2 Train Random Forest on the main training subset with best parameters
+num_trees_final <- 500
+
+rf_model <- ranger(
+  formula = loss ~ .,
+  data = train_train[, c("loss", predictor_cols)],
+  num.trees = num_trees_final,
+  mtry = best_mtry,
+  min.node.size = best_min_node,
+  importance = "impurity",
+  seed = 123
+)
+
+# 6.3 Evaluate Random Forest on validation data
+rf_pred_valid <- predict(rf_model, data = train_valid[, predictor_cols])$predictions
+rf_mae_valid <- mae(train_valid$loss, rf_pred_valid)
+cat("Random Forest MAE on validation:", round(rf_mae_valid, 4), "\n")
+
+# 6.4 Evaluate Random Forest on labeled test data (external test)
+rf_pred_test_labeled <- predict(rf_model, data = test_labeled[, predictor_cols])$predictions
+rf_mae_test_labeled <- mae(test_labeled$loss, rf_pred_test_labeled)
+cat("Random Forest MAE on labeled test:", round(rf_mae_test_labeled, 4), "\n")
+
+# Compare with baseline
+cat("Improvement over baseline (validation) :", 
+    round(baseline_mae_valid - rf_mae_valid, 4), "\n")
+cat("Improvement over baseline (labeled test):", 
+    round(baseline_mae_test_labeled - rf_mae_test_labeled, 4), "\n")
+
+############################################################
+## 7. Variable Importance (for Insights) ----
+############################################################
+
+# Extract and display top 20 most important features
+var_imp <- ranger::importance(rf_model)
+var_imp_sorted <- sort(var_imp, decreasing = TRUE)
+head(var_imp_sorted, 20)
+
+# Bar plot of top important features (useful for report)
+imp_df <- data.frame(
+  feature = names(var_imp_sorted)[1:20],
+  importance = as.numeric(var_imp_sorted[1:20])
+)
+
+ggplot(imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top 20 Important Features (Random Forest)",
+       x = "Feature",
+       y = "Importance")
+
+############################################################
+## 8. Final Model Training on ALL Labeled Data ----
+############################################################
+
+# For the final model that will be used to predict on the unlabeled
+# test set, we train on ALL data that have known loss:
+#   - Original training data
+#   - Labeled test data
+
+all_labeled <- bind_rows(train, test_labeled)
+
+cat("Total rows in all labeled data:", nrow(all_labeled), "\n")
+
+final_rf_model <- ranger(
+  formula = loss ~ .,
+  data = all_labeled[, c("loss", predictor_cols)],
+  num.trees = num_trees_final,
+  mtry = best_mtry,
+  min.node.size = best_min_node,
+  importance = "impurity",
+  seed = 123
+)
+
+############################################################
+## 9. Predict on Unlabeled Test Set & Create Submission ----
+############################################################
+
+# Predict loss for each row in the unlabeled test set
+test_unlabeled_pred <- predict(final_rf_model, 
+                               data = test_unlabeled[, predictor_cols])$predictions
+
+# Ensure no negative predicted losses (just in case)
+test_unlabeled_pred <- pmax(test_unlabeled_pred, 0)
+
+# Create submission data frame:
+#   - id: from test__no_lossv3.csv
+#   - loss: model prediction
+submission <- data.frame(
+  id = test_unlabeled$id,
+  loss = test_unlabeled_pred
+)
+
+# Inspect first few rows
+head(submission)
+
+# Write to CSV with required header format:
+# id,loss
+# 118679,0
+# ...
+write.csv(submission, "submission_loss_predictions.csv", row.names = FALSE)
+
+cat("Submission file 'submission_loss_predictions.csv' has been written to disk.\n")
+
+############################################################
+# End of Script
+############################################################
+
+
+
+
+```
+
+
+
+
+
