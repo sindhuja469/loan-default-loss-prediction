@@ -134,7 +134,7 @@ Two models were implemented and compared:
   
 ---
 
-## ⚠️ Limitations
+##  Limitations
 
 - Dataset lacks external credit bureau or income data
 - Single-stage loss modeling may conflate zero-loss and positive-loss behavior
