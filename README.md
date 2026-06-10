@@ -2,7 +2,7 @@
 From binary default flags to continuous loss prediction using Random Forest regression
 
 # 📉 Loan Default Loss Prediction  
-**Applied Data Mining – Financial Risk Modeling**
+**Advanced Data Mining – Financial Risk Modeling**
 ---
 
 ##  Project Overview
